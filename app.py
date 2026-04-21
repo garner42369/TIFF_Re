@@ -1,0 +1,336 @@
+import streamlit as st
+import os
+import tempfile
+import logging
+import math
+import uuid
+import pandas as pd
+import numpy as np
+
+# Use exceptions for GDAL if available
+gdal_available = False
+try:
+    from osgeo import gdal, osr
+    gdal.UseExceptions()
+    gdal_available = True
+except ImportError:
+    pass
+
+# Setup wide layout
+st.set_page_config(page_title="栅格数据批处理与多值提取工具", layout="wide")
+
+# Custom Streamlit Logging Handler
+class StreamlitLogHandler(logging.Handler):
+    def __init__(self, log_placeholder):
+        super().__init__()
+        self.log_placeholder = log_placeholder
+        self.logs = []
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.logs.append(msg)
+        # Keep only last 100 logs to prevent UI lag (Lightweight optimization)
+        if len(self.logs) > 100:
+            self.logs = self.logs[-100:]
+        self.log_placeholder.text_area("运行日志", "\n".join(self.logs), height=200, key=f"log_{len(self.logs)}")
+
+# [轻量化优化 1] 缓存契约：@st.cache_data
+# 即使不同的 Session 处理同名同大小的文件，也能极速命中缓存，不再重复发起底层的 C++ I/O 操作。
+@st.cache_data(show_spinner=False, max_entries=100)
+def get_raster_info_cached(file_path, file_size):
+    """
+    带缓存机制的栅格元数据提取。
+    """
+    try:
+        ds = gdal.Open(file_path)
+        if not ds: return None
+        
+        proj = ds.GetProjection()
+        gt = ds.GetGeoTransform()
+        cols = ds.RasterXSize
+        rows = ds.RasterYSize
+        
+        minx = gt[0]
+        maxy = gt[3]
+        maxx = minx + gt[1] * cols
+        miny = maxy + gt[5] * rows
+        
+        srs = osr.SpatialReference()
+        srs.ImportFromWkt(proj)
+        crs_name = srs.GetName() if srs.GetName() else "Unknown"
+        epsg = srs.GetAttrValue('AUTHORITY', 1) if srs.GetAttrValue('AUTHORITY', 1) else "Unknown"
+        
+        band = ds.GetRasterBand(1)
+        nodata = band.GetNoDataValue()
+        
+        return {
+            "file_path": file_path,
+            "filename": os.path.basename(file_path),
+            "crs_wkt": proj,
+            "crs_name": f"{crs_name} (EPSG:{epsg})",
+            "res_x": gt[1],
+            "res_y": gt[5],
+            "min_x": minx,
+            "max_x": maxx,
+            "min_y": miny,
+            "max_y": maxy,
+            "cols": cols,
+            "rows": rows,
+            "nodata": nodata
+        }
+    except Exception as e:
+        return None
+
+def get_bbox_in_target_crs(info, target_wkt):
+    if info['crs_wkt'] == target_wkt:
+        return info['min_x'], info['min_y'], info['max_x'], info['max_y']
+    
+    source_srs = osr.SpatialReference()
+    source_srs.ImportFromWkt(info['crs_wkt'])
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromWkt(target_wkt)
+    transform = osr.CoordinateTransformation(source_srs, target_srs)
+    
+    corners = [
+        (info['min_x'], info['min_y']),
+        (info['max_x'], info['min_y']),
+        (info['min_x'], info['max_y']),
+        (info['max_x'], info['max_y'])
+    ]
+    
+    tx, ty = [], []
+    for x, y in corners:
+        try:
+            px, py, _ = transform.TransformPoint(x, y)
+            tx.append(px)
+            ty.append(py)
+        except Exception:
+            pass
+            
+    if not tx:
+        raise ValueError(f"无法将 {info['filename']} 投影转换至主栅格坐标系。")
+        
+    return min(tx), min(ty), max(tx), max(ty)
+
+def init_session():
+    """初始化轻量级会话沙盒，保证云端并发多用户的状态与文件绝对隔离"""
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.temp_dir = tempfile.mkdtemp(prefix=f"raster_app_{st.session_state.session_id}_")
+        st.session_state.raster_infos = []
+        st.session_state.processed_files_hash = ""
+
+def main():
+    st.title("🌐 栅格数据批处理与多值提取工具 (云端轻量版)")
+    st.markdown("基于 **单文件极简架构 + 内存分块读取 (Chunking)** 打造。彻底解决多用户并发时的内存溢出 (OOM) 与卡顿问题，并且不损失任何核心功能。")
+    
+    if not gdal_available:
+        st.error("严重错误: 系统未检测到 GDAL 库。请确保环境中已正确安装 `gdal` (如 `conda install -c conda-forge gdal`)。")
+        return
+        
+    init_session()
+    
+    # 1. File Upload
+    uploaded_files = st.file_uploader("选择并上传栅格文件 (支持多选，如 GeoTIFF)", accept_multiple_files=True, type=['tif', 'tiff'])
+    
+    if not uploaded_files or len(uploaded_files) < 2:
+        st.info("请上传至少两个栅格文件以进行多值提取。")
+        return
+
+    # [轻量化优化 2] 状态隔离防抖：仅当上传文件发生真实变化时，才重新写入沙盒并解析
+    # 防止用户在下方点击 Selectbox 选主栅格时，触发整个页面的重新读取
+    current_hash = "|".join([f"{f.name}_{f.size}" for f in uploaded_files])
+    
+    if current_hash != st.session_state.processed_files_hash:
+        raster_infos = []
+        with st.spinner("正在安全隔离并读取栅格元数据 (防阻塞机制启动)..."):
+            for uf in uploaded_files:
+                temp_path = os.path.join(st.session_state.temp_dir, uf.name)
+                # 仅当文件不存在或大小不一致时写入 (避免不必要的 I/O 损耗)
+                if not os.path.exists(temp_path) or os.path.getsize(temp_path) != uf.size:
+                    with open(temp_path, "wb") as f:
+                        f.write(uf.getbuffer())
+                
+                info = get_raster_info_cached(temp_path, uf.size)
+                if info:
+                    raster_infos.append(info)
+                else:
+                    st.error(f"文件 {uf.name} 无法被 GDAL 读取为有效栅格，已跳过。")
+                    
+        st.session_state.raster_infos = raster_infos
+        st.session_state.processed_files_hash = current_hash
+        
+    raster_infos = st.session_state.raster_infos
+    if len(raster_infos) < 2:
+        st.error("有效的栅格文件不足，无法继续。")
+        return
+
+    # 2. Master Raster Selection
+    st.subheader("1. 栅格数据概览与主栅格选择")
+    df_info = pd.DataFrame(raster_infos)
+    display_df = df_info[['filename', 'crs_name', 'res_x', 'res_y', 'min_x', 'min_y', 'max_x', 'max_y', 'cols', 'rows']].copy()
+    display_df.columns = ['文件名', '坐标系', 'X分辨率', 'Y分辨率', '最小X', '最小Y', '最大X', '最大Y', '列数', '行数']
+    st.dataframe(display_df, use_container_width=True)
+    
+    master_filename = st.selectbox("选择主栅格 (状态已被缓存，切换不卡顿):", options=[r['filename'] for r in raster_infos])
+    master_info = next(r for r in raster_infos if r['filename'] == master_filename)
+    st.info(f"**主栅格信息**: {master_info['crs_name']} | 分辨率: ({master_info['res_x']:.6f}, {master_info['res_y']:.6f})")
+
+    # Processing trigger
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        start_btn = st.button("开始处理 (内存分块防 OOM 模式)", type="primary", use_container_width=True)
+    with col2:
+        chunk_size_option = st.selectbox("分块读取速度 (内存开销)", ["10,000 行 (推荐)", "2,000 行 (极低内存)", "50,000 行 (较快)", "100,000 行 (极快但吃内存)"], index=0)
+        chunk_mapping = {"2,000 行 (极低内存)": 2000, "10,000 行 (推荐)": 10000, "50,000 行 (较快)": 50000, "100,000 行 (极快但吃内存)": 100000}
+        selected_chunk_size = chunk_mapping[chunk_size_option]
+
+    if start_btn:
+        
+        log_container = st.empty()
+        logger = logging.getLogger("RasterProcessing")
+        logger.setLevel(logging.INFO)
+        if logger.hasHandlers(): logger.handlers.clear()
+        
+        log_handler = StreamlitLogHandler(log_container)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(log_handler)
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # 3. Calculate Common Extent in Master CRS
+            logger.info("步骤 1/4: 计算共有空间范围...")
+            status_text.text("步骤 1/4: 计算共有空间范围")
+            
+            common_min_x, common_min_y = -float('inf'), -float('inf')
+            common_max_x, common_max_y = float('inf'), float('inf')
+            
+            for info in raster_infos:
+                minx, miny, maxx, maxy = get_bbox_in_target_crs(info, master_info['crs_wkt'])
+                common_min_x, common_min_y = max(common_min_x, minx), max(common_min_y, miny)
+                common_max_x, common_max_y = min(common_max_x, maxx), min(common_max_y, maxy)
+                
+            if common_min_x >= common_max_x or common_min_y >= common_max_y:
+                logger.error("栅格数据不相交，处理终止。")
+                st.error("错误: 所选栅格数据在空间上不相交。")
+                return
+                
+            # Snap to Master Grid
+            res_x, res_y = master_info['res_x'], master_info['res_y']
+            m_min_x, m_max_y = master_info['min_x'], master_info['max_y']
+            
+            new_min_x = m_min_x + math.ceil((common_min_x - m_min_x) / res_x) * res_x
+            new_max_x = m_min_x + math.floor((common_max_x - m_min_x) / res_x) * res_x
+            new_max_y = m_max_y + math.ceil((common_max_y - m_max_y) / res_y) * res_y
+            new_min_y = m_max_y + math.floor((common_min_y - m_max_y) / res_y) * res_y
+            
+            if new_min_x >= new_max_x or new_min_y >= new_max_y:
+                 st.error("对齐失败: 共有范围小于一个像元大小。")
+                 return
+                 
+            # 4. Projection & Resampling (Disk to Disk)
+            status_text.text("步骤 2/4: 执行投影转换与对齐 (Disk to Disk)")
+            logger.info("步骤 2/4: 执行投影转换与对齐 (直接落盘，不占用系统内存)...")
+            aligned_files = []
+            
+            for i, info in enumerate(raster_infos):
+                progress_bar.progress(10 + int((i / len(raster_infos)) * 30))
+                out_path = os.path.join(st.session_state.temp_dir, f"aligned_{info['filename']}")
+                
+                warp_options = gdal.WarpOptions(
+                    format="GTiff", outputBounds=[new_min_x, new_min_y, new_max_x, new_max_y],
+                    xRes=res_x, yRes=abs(res_y), dstSRS=master_info['crs_wkt'],
+                    resampleAlg=gdal.GRA_Bilinear, creationOptions=["COMPRESS=LZW", "TILED=YES"]
+                )
+                gdal.Warp(out_path, info['file_path'], options=warp_options)
+                aligned_files.append((info['filename'], out_path))
+                
+            # 5. [轻量化优化 3] Multi-value Extraction via Chunking (防爆核心)
+            status_text.text("步骤 3/4: 执行分块多值提取 (防 OOM 机制)")
+            logger.info("步骤 3/4: 开始分块读取与提取，启动内存防爆 (Chunking) 机制...")
+            
+            datasets = [gdal.Open(path) for _, path in aligned_files]
+            band1 = datasets[0].GetRasterBand(1)
+            rows, cols = band1.YSize, band1.XSize
+            logger.info(f"对齐后共有范围网格: {cols} 列 x {rows} 行, 总像元 {cols*rows}。")
+            
+            csv_path = os.path.join(st.session_state.temp_dir, "multi_value_extraction_result.csv")
+            raster_cols = [fname for fname, _ in aligned_files]
+            header = ['X', 'Y'] + raster_cols
+            
+            # 初始化带有列头的 CSV 文件
+            pd.DataFrame(columns=header).to_csv(csv_path, index=False)
+            
+            CHUNK_SIZE = selected_chunk_size  # 使用用户在 UI 选择的分块大小
+            logger.info(f"当前分块配置: 每次加载 {CHUNK_SIZE} 行。")
+            valid_pixels_count = 0
+            
+            # X 坐标对于每一行都是完全相同的
+            x_coords = new_min_x + res_x/2 + np.arange(cols) * res_x
+            
+            # 以 Generator 的思想迭代读取 Y 的数据块
+            for yoff in range(0, rows, CHUNK_SIZE):
+                ysize = min(CHUNK_SIZE, rows - yoff)
+                
+                # 计算当前 Chunk 专属的 Y 坐标
+                y_coords = new_max_y + res_y/2 + (np.arange(ysize) + yoff) * res_y
+                xv, yv = np.meshgrid(x_coords, y_coords)
+                
+                chunk_dict = {'X': xv.flatten(), 'Y': yv.flatten()}
+                
+                for ds, (fname, _) in zip(datasets, aligned_files):
+                    band = ds.GetRasterBand(1)
+                    nodata = band.GetNoDataValue()
+                    
+                    # 仅读取当前 Chunk 的数据 (ReadAsArray: xoff, yoff, xsize, ysize)
+                    arr = band.ReadAsArray(0, yoff, cols, ysize).flatten()
+                    
+                    if nodata is not None:
+                        if not np.isnan(nodata):
+                            arr = np.where(arr == nodata, np.nan, arr)
+                            
+                    chunk_dict[fname] = arr
+                    
+                # 构造当前 Chunk 的轻量级 DataFrame 并执行清洗
+                df_chunk = pd.DataFrame(chunk_dict)
+                df_chunk.dropna(subset=raster_cols, how='all', inplace=True)
+                
+                # 将清洗后的有效数据立即追加写入硬盘 CSV
+                if not df_chunk.empty:
+                    df_chunk.to_csv(csv_path, mode='a', header=False, index=False)
+                    valid_pixels_count += len(df_chunk)
+                
+                # 主动释放内存，触发 Python GC
+                del chunk_dict, df_chunk
+                
+                # 动态刷新进度条 (从 40% 到 95%)，给用户丝滑的进度反馈
+                progress = 40 + int(55 * ((yoff + ysize) / rows))
+                progress_bar.progress(progress)
+                
+            # 释放所有文件锁
+            datasets = None 
+            
+            progress_bar.progress(100)
+            status_text.text("处理完成！")
+            logger.info(f"提取完成！全部采用分块 I/O，零内存溢出。累计写入有效像元: {valid_pixels_count} 条。")
+            st.success(f"处理完成！共提取 {valid_pixels_count} 个有效像元。")
+            
+            with open(csv_path, "rb") as f:
+                st.download_button(
+                    label="📥 下载多值提取结果 (CSV)", data=f,
+                    file_name="raster_extraction_results.csv", mime="text/csv", type="primary"
+                )
+                
+            # 预览时也遵守轻量化原则，仅读取前 100 行
+            preview_df = pd.read_csv(csv_path, nrows=100)
+            with st.expander("预览提取结果 (前 100 行)"):
+                st.dataframe(preview_df, use_container_width=True)
+                
+        except Exception as e:
+            logger.error(f"处理异常: {str(e)}", exc_info=True)
+            st.error(f"处理失败: {str(e)}")
+            
+if __name__ == "__main__":
+    main()

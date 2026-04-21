@@ -1,0 +1,5 @@
+# Streamlit Community Cloud (基于 Debian Linux) 系统级依赖
+# 这是 GDAL 正常运行所必须的 C/C++ 动态链接库和头文件
+gdal-bin
+libgdal-dev
+python3-gdal

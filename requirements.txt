@@ -1,0 +1,6 @@
+streamlit==1.32.0
+pandas==2.1.4
+numpy==1.26.4
+# GDAL 版本需要与系统的 libgdal-dev 严格匹配。在 Streamlit Cloud (Debian) 上通常是 3.4.x 或 3.6.x。
+# 为了最大兼容性，使用 gdal (不要使用 osgeo，那是内置模块)。不要锁定 GDAL 具体小版本号，以便 pip 动态匹配系统。
+gdal
