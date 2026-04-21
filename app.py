@@ -7,14 +7,15 @@ import uuid
 import pandas as pd
 import numpy as np
 
-# Use exceptions for GDAL if available
-gdal_available = False
+# 使用 rasterio 替代原生 GDAL，自带预编译 C++ 库，云端部署 100% 成功
 try:
-    from osgeo import gdal, osr
-    gdal.UseExceptions()
-    gdal_available = True
+    import rasterio
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    from rasterio.transform import Affine
+    from pyproj import CRS, Transformer
+    rasterio_available = True
 except ImportError:
-    pass
+    rasterio_available = False
 
 # Setup wide layout
 st.set_page_config(page_title="栅格数据批处理与多值提取工具", layout="wide")
@@ -29,91 +30,73 @@ class StreamlitLogHandler(logging.Handler):
     def emit(self, record):
         msg = self.format(record)
         self.logs.append(msg)
-        # Keep only last 100 logs to prevent UI lag (Lightweight optimization)
+        # Keep only last 100 logs to prevent UI lag
         if len(self.logs) > 100:
             self.logs = self.logs[-100:]
         self.log_placeholder.text_area("运行日志", "\n".join(self.logs), height=200, key=f"log_{len(self.logs)}")
 
-# [轻量化优化 1] 缓存契约：@st.cache_data
-# 即使不同的 Session 处理同名同大小的文件，也能极速命中缓存，不再重复发起底层的 C++ I/O 操作。
 @st.cache_data(show_spinner=False, max_entries=100)
 def get_raster_info_cached(file_path, file_size):
     """
-    带缓存机制的栅格元数据提取。
+    带缓存机制的栅格元数据提取 (使用 Rasterio 重写)
     """
     try:
-        ds = gdal.Open(file_path)
-        if not ds: return None
-        
-        proj = ds.GetProjection()
-        gt = ds.GetGeoTransform()
-        cols = ds.RasterXSize
-        rows = ds.RasterYSize
-        
-        minx = gt[0]
-        maxy = gt[3]
-        maxx = minx + gt[1] * cols
-        miny = maxy + gt[5] * rows
-        
-        srs = osr.SpatialReference()
-        srs.ImportFromWkt(proj)
-        crs_name = srs.GetName() if srs.GetName() else "Unknown"
-        epsg = srs.GetAttrValue('AUTHORITY', 1) if srs.GetAttrValue('AUTHORITY', 1) else "Unknown"
-        
-        band = ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        
-        return {
-            "file_path": file_path,
-            "filename": os.path.basename(file_path),
-            "crs_wkt": proj,
-            "crs_name": f"{crs_name} (EPSG:{epsg})",
-            "res_x": gt[1],
-            "res_y": gt[5],
-            "min_x": minx,
-            "max_x": maxx,
-            "min_y": miny,
-            "max_y": maxy,
-            "cols": cols,
-            "rows": rows,
-            "nodata": nodata
-        }
+        with rasterio.open(file_path) as src:
+            proj = src.crs.to_wkt() if src.crs else ""
+            crs_name = src.crs.name if src.crs else "Unknown"
+            epsg = src.crs.to_epsg() if src.crs else "Unknown"
+            
+            # rasterio.transform: Affine(a, b, c, d, e, f)
+            # a=res_x, c=min_x, e=res_y, f=max_y
+            gt = src.transform
+            res_x = gt.a
+            res_y = gt.e
+            minx = src.bounds.left
+            maxy = src.bounds.top
+            maxx = src.bounds.right
+            miny = src.bounds.bottom
+            
+            cols = src.width
+            rows = src.height
+            nodata = src.nodata
+            
+            return {
+                "file_path": file_path,
+                "filename": os.path.basename(file_path),
+                "crs_wkt": proj,
+                "crs_name": f"{crs_name} (EPSG:{epsg})",
+                "res_x": res_x,
+                "res_y": res_y,
+                "min_x": minx,
+                "max_x": maxx,
+                "min_y": miny,
+                "max_y": maxy,
+                "cols": cols,
+                "rows": rows,
+                "nodata": nodata
+            }
     except Exception as e:
         return None
 
 def get_bbox_in_target_crs(info, target_wkt):
+    """使用 pyproj 重写的包围盒投影转换"""
     if info['crs_wkt'] == target_wkt:
         return info['min_x'], info['min_y'], info['max_x'], info['max_y']
     
-    source_srs = osr.SpatialReference()
-    source_srs.ImportFromWkt(info['crs_wkt'])
-    target_srs = osr.SpatialReference()
-    target_srs.ImportFromWkt(target_wkt)
-    transform = osr.CoordinateTransformation(source_srs, target_srs)
+    source_crs = CRS.from_wkt(info['crs_wkt'])
+    target_crs = CRS.from_wkt(target_wkt)
+    transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
     
-    corners = [
-        (info['min_x'], info['min_y']),
-        (info['max_x'], info['min_y']),
-        (info['min_x'], info['max_y']),
-        (info['max_x'], info['max_y'])
-    ]
+    corners_x = [info['min_x'], info['max_x'], info['min_x'], info['max_x']]
+    corners_y = [info['min_y'], info['min_y'], info['max_y'], info['max_y']]
     
-    tx, ty = [], []
-    for x, y in corners:
-        try:
-            px, py, _ = transform.TransformPoint(x, y)
-            tx.append(px)
-            ty.append(py)
-        except Exception:
-            pass
-            
-    if not tx:
+    try:
+        tx, ty = transformer.transform(corners_x, corners_y)
+        return min(tx), min(ty), max(tx), max(ty)
+    except Exception:
         raise ValueError(f"无法将 {info['filename']} 投影转换至主栅格坐标系。")
-        
-    return min(tx), min(ty), max(tx), max(ty)
 
 def init_session():
-    """初始化轻量级会话沙盒，保证云端并发多用户的状态与文件绝对隔离"""
     if 'session_id' not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.temp_dir = tempfile.mkdtemp(prefix=f"raster_app_{st.session_state.session_id}_")
@@ -121,11 +104,11 @@ def init_session():
         st.session_state.processed_files_hash = ""
 
 def main():
-    st.title("🌐 栅格数据批处理与多值提取工具 (云端轻量版)")
-    st.markdown("基于 **单文件极简架构 + 内存分块读取 (Chunking)** 打造。彻底解决多用户并发时的内存溢出 (OOM) 与卡顿问题，并且不损失任何核心功能。")
+    st.title("🌐 栅格数据批处理与多值提取工具 (云端免编译版)")
+    st.markdown("基于 **Rasterio (纯 Python 预编译版)** 重构，完美避开 GDAL C++ 编译噩梦。采用内存分块读取 (Chunking) 彻底解决多用户并发时的内存溢出问题。")
     
-    if not gdal_available:
-        st.error("严重错误: 系统未检测到 GDAL 库。请确保环境中已正确安装 `gdal` (如 `conda install -c conda-forge gdal`)。")
+    if not rasterio_available:
+        st.error("严重错误: 系统未检测到 rasterio 库。请执行 `pip install rasterio pyproj`。")
         return
         
     init_session()
@@ -137,16 +120,13 @@ def main():
         st.info("请上传至少两个栅格文件以进行多值提取。")
         return
 
-    # [轻量化优化 2] 状态隔离防抖：仅当上传文件发生真实变化时，才重新写入沙盒并解析
-    # 防止用户在下方点击 Selectbox 选主栅格时，触发整个页面的重新读取
     current_hash = "|".join([f"{f.name}_{f.size}" for f in uploaded_files])
     
     if current_hash != st.session_state.processed_files_hash:
         raster_infos = []
-        with st.spinner("正在安全隔离并读取栅格元数据 (防阻塞机制启动)..."):
+        with st.spinner("正在安全隔离并读取栅格元数据 (Rasterio 引擎)..."):
             for uf in uploaded_files:
                 temp_path = os.path.join(st.session_state.temp_dir, uf.name)
-                # 仅当文件不存在或大小不一致时写入 (避免不必要的 I/O 损耗)
                 if not os.path.exists(temp_path) or os.path.getsize(temp_path) != uf.size:
                     with open(temp_path, "wb") as f:
                         f.write(uf.getbuffer())
@@ -155,7 +135,7 @@ def main():
                 if info:
                     raster_infos.append(info)
                 else:
-                    st.error(f"文件 {uf.name} 无法被 GDAL 读取为有效栅格，已跳过。")
+                    st.error(f"文件 {uf.name} 无法被读取为有效栅格，已跳过。")
                     
         st.session_state.raster_infos = raster_infos
         st.session_state.processed_files_hash = current_hash
@@ -186,7 +166,6 @@ def main():
         selected_chunk_size = chunk_mapping[chunk_size_option]
 
     if start_btn:
-        
         log_container = st.empty()
         logger = logging.getLogger("RasterProcessing")
         logger.setLevel(logging.INFO)
@@ -230,62 +209,85 @@ def main():
                  st.error("对齐失败: 共有范围小于一个像元大小。")
                  return
                  
-            # 4. Projection & Resampling (Disk to Disk)
-            status_text.text("步骤 2/4: 执行投影转换与对齐 (Disk to Disk)")
+            # 4. Projection & Resampling (Rasterio reproject)
+            status_text.text("步骤 2/4: 执行投影转换与对齐 (Rasterio Engine)")
             logger.info("步骤 2/4: 执行投影转换与对齐 (直接落盘，不占用系统内存)...")
             aligned_files = []
+            
+            # Calculate output shape and transform
+            out_transform = Affine(res_x, 0.0, new_min_x, 0.0, res_y, new_max_y)
+            out_width = int(round((new_max_x - new_min_x) / res_x))
+            out_height = int(round((new_min_y - new_max_y) / res_y)) # res_y is negative
+            
+            dst_crs = CRS.from_wkt(master_info['crs_wkt'])
             
             for i, info in enumerate(raster_infos):
                 progress_bar.progress(10 + int((i / len(raster_infos)) * 30))
                 out_path = os.path.join(st.session_state.temp_dir, f"aligned_{info['filename']}")
                 
-                warp_options = gdal.WarpOptions(
-                    format="GTiff", outputBounds=[new_min_x, new_min_y, new_max_x, new_max_y],
-                    xRes=res_x, yRes=abs(res_y), dstSRS=master_info['crs_wkt'],
-                    resampleAlg=gdal.GRA_Bilinear, creationOptions=["COMPRESS=LZW", "TILED=YES"]
-                )
-                gdal.Warp(out_path, info['file_path'], options=warp_options)
+                with rasterio.open(info['file_path']) as src:
+                    kwargs = src.meta.copy()
+                    kwargs.update({
+                        'crs': dst_crs,
+                        'transform': out_transform,
+                        'width': out_width,
+                        'height': out_height,
+                        'compress': 'lzw',
+                        'tiled': True
+                    })
+                    
+                    with rasterio.open(out_path, 'w', **kwargs) as dst:
+                        for j in range(1, src.count + 1):
+                            reproject(
+                                source=rasterio.band(src, j),
+                                destination=rasterio.band(dst, j),
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=out_transform,
+                                dst_crs=dst_crs,
+                                resampling=Resampling.bilinear
+                            )
+                            
                 aligned_files.append((info['filename'], out_path))
                 
-            # 5. [轻量化优化 3] Multi-value Extraction via Chunking (防爆核心)
+            # 5. Multi-value Extraction via Chunking (防爆核心)
             status_text.text("步骤 3/4: 执行分块多值提取 (防 OOM 机制)")
             logger.info("步骤 3/4: 开始分块读取与提取，启动内存防爆 (Chunking) 机制...")
             
-            datasets = [gdal.Open(path) for _, path in aligned_files]
-            band1 = datasets[0].GetRasterBand(1)
-            rows, cols = band1.YSize, band1.XSize
+            # Open all aligned datasets with rasterio
+            datasets = [rasterio.open(path) for _, path in aligned_files]
+            
+            rows, cols = out_height, out_width
             logger.info(f"对齐后共有范围网格: {cols} 列 x {rows} 行, 总像元 {cols*rows}。")
             
             csv_path = os.path.join(st.session_state.temp_dir, "multi_value_extraction_result.csv")
             raster_cols = [fname for fname, _ in aligned_files]
             header = ['X', 'Y'] + raster_cols
             
-            # 初始化带有列头的 CSV 文件
             pd.DataFrame(columns=header).to_csv(csv_path, index=False)
             
-            CHUNK_SIZE = selected_chunk_size  # 使用用户在 UI 选择的分块大小
+            CHUNK_SIZE = selected_chunk_size
             logger.info(f"当前分块配置: 每次加载 {CHUNK_SIZE} 行。")
             valid_pixels_count = 0
             
-            # X 坐标对于每一行都是完全相同的
             x_coords = new_min_x + res_x/2 + np.arange(cols) * res_x
             
-            # 以 Generator 的思想迭代读取 Y 的数据块
             for yoff in range(0, rows, CHUNK_SIZE):
                 ysize = min(CHUNK_SIZE, rows - yoff)
                 
-                # 计算当前 Chunk 专属的 Y 坐标
                 y_coords = new_max_y + res_y/2 + (np.arange(ysize) + yoff) * res_y
                 xv, yv = np.meshgrid(x_coords, y_coords)
                 
                 chunk_dict = {'X': xv.flatten(), 'Y': yv.flatten()}
                 
+                # rasterio Window(col_off, row_off, width, height)
+                from rasterio.windows import Window
+                window = Window(0, yoff, cols, ysize)
+                
                 for ds, (fname, _) in zip(datasets, aligned_files):
-                    band = ds.GetRasterBand(1)
-                    nodata = band.GetNoDataValue()
-                    
-                    # 仅读取当前 Chunk 的数据 (ReadAsArray: xoff, yoff, xsize, ysize)
-                    arr = band.ReadAsArray(0, yoff, cols, ysize).flatten()
+                    nodata = ds.nodata
+                    # Read only the window
+                    arr = ds.read(1, window=window).flatten()
                     
                     if nodata is not None:
                         if not np.isnan(nodata):
@@ -293,28 +295,25 @@ def main():
                             
                     chunk_dict[fname] = arr
                     
-                # 构造当前 Chunk 的轻量级 DataFrame 并执行清洗
                 df_chunk = pd.DataFrame(chunk_dict)
                 df_chunk.dropna(subset=raster_cols, how='all', inplace=True)
                 
-                # 将清洗后的有效数据立即追加写入硬盘 CSV
                 if not df_chunk.empty:
                     df_chunk.to_csv(csv_path, mode='a', header=False, index=False)
                     valid_pixels_count += len(df_chunk)
                 
-                # 主动释放内存，触发 Python GC
                 del chunk_dict, df_chunk
                 
-                # 动态刷新进度条 (从 40% 到 95%)，给用户丝滑的进度反馈
                 progress = 40 + int(55 * ((yoff + ysize) / rows))
                 progress_bar.progress(progress)
                 
-            # 释放所有文件锁
-            datasets = None 
+            # Close all datasets
+            for ds in datasets:
+                ds.close()
             
             progress_bar.progress(100)
             status_text.text("处理完成！")
-            logger.info(f"提取完成！全部采用分块 I/O，零内存溢出。累计写入有效像元: {valid_pixels_count} 条。")
+            logger.info(f"提取完成！采用 Rasterio 分块 I/O，零内存溢出。累计写入有效像元: {valid_pixels_count} 条。")
             st.success(f"处理完成！共提取 {valid_pixels_count} 个有效像元。")
             
             with open(csv_path, "rb") as f:
@@ -323,7 +322,6 @@ def main():
                     file_name="raster_extraction_results.csv", mime="text/csv", type="primary"
                 )
                 
-            # 预览时也遵守轻量化原则，仅读取前 100 行
             preview_df = pd.read_csv(csv_path, nrows=100)
             with st.expander("预览提取结果 (前 100 行)"):
                 st.dataframe(preview_df, use_container_width=True)
