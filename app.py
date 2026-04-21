@@ -10,9 +10,9 @@ import numpy as np
 # 使用 rasterio 替代原生 GDAL，自带预编译 C++ 库，云端部署 100% 成功
 try:
     import rasterio
-    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    from rasterio.warp import calculate_default_transform, reproject, Resampling, transform_bounds
     from rasterio.transform import Affine
-    from pyproj import CRS, Transformer
+    from rasterio.crs import CRS
     rasterio_available = True
 except ImportError:
     rasterio_available = False
@@ -79,20 +79,20 @@ def get_raster_info_cached(file_path, file_size):
         return None
 
 def get_bbox_in_target_crs(info, target_wkt):
-    """使用 pyproj 重写的包围盒投影转换"""
+    """使用 rasterio 原生的 transform_bounds 处理极地投影弧度变形问题"""
     if info['crs_wkt'] == target_wkt:
         return info['min_x'], info['min_y'], info['max_x'], info['max_y']
     
     source_crs = CRS.from_wkt(info['crs_wkt'])
     target_crs = CRS.from_wkt(target_wkt)
-    transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
-    
-    corners_x = [info['min_x'], info['max_x'], info['min_x'], info['max_x']]
-    corners_y = [info['min_y'], info['min_y'], info['max_y'], info['max_y']]
     
     try:
-        tx, ty = transformer.transform(corners_x, corners_y)
-        return min(tx), min(ty), max(tx), max(ty)
+        # transform_bounds 内置 densify_pts 参数，能准确获取变形后的包围盒极限值
+        left, bottom, right, top = transform_bounds(
+            source_crs, target_crs,
+            info['min_x'], info['min_y'], info['max_x'], info['max_y']
+        )
+        return left, bottom, right, top
     except Exception:
         raise ValueError(f"无法将 {info['filename']} 投影转换至主栅格坐标系。")
 
@@ -108,7 +108,7 @@ def main():
     st.markdown("基于 **Rasterio (纯 Python 预编译版)** 重构，完美避开 GDAL C++ 编译噩梦。采用内存分块读取 (Chunking) 彻底解决多用户并发时的内存溢出问题。")
     
     if not rasterio_available:
-        st.error("严重错误: 系统未检测到 rasterio 库。请执行 `pip install rasterio pyproj`。")
+        st.error("严重错误: 系统未检测到 rasterio 库。请执行 `pip install rasterio`。")
         return
         
     init_session()
@@ -216,8 +216,8 @@ def main():
             
             # Calculate output shape and transform
             out_transform = Affine(res_x, 0.0, new_min_x, 0.0, res_y, new_max_y)
-            out_width = int(round((new_max_x - new_min_x) / res_x))
-            out_height = int(round((new_min_y - new_max_y) / res_y)) # res_y is negative
+            out_width = int(round(abs((new_max_x - new_min_x) / res_x)))
+            out_height = int(round(abs((new_min_y - new_max_y) / res_y)))
             
             dst_crs = CRS.from_wkt(master_info['crs_wkt'])
             
@@ -290,7 +290,7 @@ def main():
                     arr = ds.read(1, window=window).flatten()
                     
                     if nodata is not None:
-                        if not np.isnan(nodata):
+                        if isinstance(nodata, (int, float)) and not pd.isna(nodata):
                             arr = np.where(arr == nodata, np.nan, arr)
                             
                     chunk_dict[fname] = arr
