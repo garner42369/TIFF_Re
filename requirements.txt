@@ -1,6 +1,22 @@
-streamlit==1.32.0
-pandas==2.1.4
-numpy==1.26.4
-# GDAL 版本需要与系统的 libgdal-dev 严格匹配。在 Streamlit Cloud (Debian) 上通常是 3.4.x 或 3.6.x。
-# 为了最大兼容性，使用 gdal (不要使用 osgeo，那是内置模块)。不要锁定 GDAL 具体小版本号，以便 pip 动态匹配系统。
+# 核心 Web 框架
+streamlit>=1.32.0
+
+# 数据处理与矩阵计算
+pandas>=2.1.0
+numpy>=1.24.0
+
+# ---------------------------------------------------------
+# 【核心警告】GDAL 的特殊安装机制：
+# ---------------------------------------------------------
+# Streamlit Community Cloud 底层是 Debian Linux，它会通过 packages.txt
+# 首先安装系统级别的 GDAL C++ 库（如 libgdal-dev，版本通常是 3.4.x 或 3.6.x）。
+# 
+# 为了让 Python 的 GDAL 库与底层 C++ 库的 API 完全对齐，必须：
+# 1. 绝对不能在这里写死具体版本号 (如 gdal==3.6.4)。
+# 2. 如果写死版本号，且与系统的版本不一致，部署时会直接报 "gdal-config not found" 或 "SWIG version error" 导致构建崩溃。
+# 3. 留空版本号 `gdal` 会让 pip 安装时自动调用 `gdal-config` 去嗅探系统版本，从而编译出 100% 兼容的 Python Wheel。
+# ---------------------------------------------------------
 gdal
+
+# 仅在开发环境中需要用到，云端可以忽略
+# watchdog
