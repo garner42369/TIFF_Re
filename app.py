@@ -10,7 +10,7 @@ import numpy as np
 # 使用 rasterio 替代原生 GDAL，自带预编译 C++ 库，云端部署 100% 成功
 try:
     import rasterio
-    from rasterio.warp import calculate_default_transform, reproject, Resampling, transform_bounds
+    from rasterio.warp import reproject, Resampling, transform_bounds
     from rasterio.transform import Affine
     from rasterio.crs import CRS
     rasterio_available = True
@@ -39,32 +39,81 @@ class StreamlitLogHandler(logging.Handler):
 def get_raster_info_cached(file_path, file_size):
     """
     带缓存机制的栅格元数据提取 (使用 Rasterio 重写)
+    返回: (info_dict, error_message) 或 (None, error_message)
     """
+    filename = os.path.basename(file_path)
+    
     try:
         with rasterio.open(file_path) as src:
-            proj = src.crs.to_wkt() if src.crs else ""
-            crs_name = src.crs.name if src.crs else "Unknown"
-            epsg = src.crs.to_epsg() if src.crs else "Unknown"
+            # 1. 检查驱动程序
+            driver = src.driver
+            if driver not in ['GTiff', 'COG']:
+                return None, f"文件格式不支持: {driver}。仅支持 GeoTIFF 格式。"
             
-            # rasterio.transform: Affine(a, b, c, d, e, f)
-            # a=res_x, c=min_x, e=res_y, f=max_y
-            gt = src.transform
-            res_x = gt.a
-            res_y = gt.e
-            minx = src.bounds.left
-            maxy = src.bounds.top
-            maxx = src.bounds.right
-            miny = src.bounds.bottom
+            # 2. 处理坐标系信息 - 严格检查，所有栅格必须有坐标系
+            if src.crs is None:
+                return None, f"栅格没有坐标系信息。请确保 GeoTIFF 包含有效的坐标系定义（如 EPSG 代码或 WKT）。"
             
+            try:
+                proj = src.crs.to_wkt()
+            except Exception as e:
+                return None, f"无法读取坐标系 WKT: {str(e)}"
+            
+            if not proj:
+                return None, f"坐标系 WKT 为空。请确保 GeoTIFF 包含有效的坐标系定义。"
+            
+            try:
+                crs_name = src.crs.name if src.crs.name else "Unknown"
+            except Exception as e:
+                crs_name = "Unknown"
+            
+            try:
+                epsg = src.crs.to_epsg()
+                epsg_str = str(epsg) if epsg is not None else "Unknown"
+            except Exception as e:
+                epsg_str = "Unknown"
+            
+            # 3. 处理地理变换信息
+            try:
+                gt = src.transform
+                res_x = gt.a
+                res_y = gt.e
+            except Exception as e:
+                return None, f"无法读取地理变换信息: {str(e)}"
+            
+            # 4. 处理边界信息
+            try:
+                minx = src.bounds.left
+                maxy = src.bounds.top
+                maxx = src.bounds.right
+                miny = src.bounds.bottom
+            except Exception as e:
+                # 如果无法获取 bounds，使用 transform 和尺寸计算
+                try:
+                    minx = gt.c
+                    maxy = gt.f
+                    maxx = gt.c + gt.a * src.width
+                    miny = gt.f + gt.e * src.height
+                except Exception as e2:
+                    return None, f"无法获取空间边界信息: {str(e)}, {str(e2)}"
+            
+            # 5. 基本信息
             cols = src.width
             rows = src.height
             nodata = src.nodata
             
+            # 6. 验证关键信息
+            if cols <= 0 or rows <= 0:
+                return None, f"栅格尺寸无效: {cols} x {rows}"
+            
+            if res_x == 0 or res_y == 0:
+                return None, f"分辨率无效: ({res_x}, {res_y})"
+            
             return {
                 "file_path": file_path,
-                "filename": os.path.basename(file_path),
+                "filename": filename,
                 "crs_wkt": proj,
-                "crs_name": f"{crs_name} (EPSG:{epsg})",
+                "crs_name": f"{crs_name} (EPSG:{epsg_str})",
                 "res_x": res_x,
                 "res_y": res_y,
                 "min_x": minx,
@@ -73,13 +122,18 @@ def get_raster_info_cached(file_path, file_size):
                 "max_y": maxy,
                 "cols": cols,
                 "rows": rows,
-                "nodata": nodata
-            }
+                "nodata": nodata,
+                "driver": driver
+            }, None
+            
+    except rasterio.errors.RasterioIOError as e:
+        return None, f"Rasterio 无法打开文件: {str(e)}"
     except Exception as e:
-        return None
+        return None, f"读取栅格时发生未知错误: {str(e)}"
 
 def get_bbox_in_target_crs(info, target_wkt):
     """使用 rasterio 原生的 transform_bounds 处理极地投影弧度变形问题"""
+    # 所有栅格都有坐标系（已在 get_raster_info_cached 中验证）
     if info['crs_wkt'] == target_wkt:
         return info['min_x'], info['min_y'], info['max_x'], info['max_y']
     
@@ -131,11 +185,11 @@ def main():
                     with open(temp_path, "wb") as f:
                         f.write(uf.getbuffer())
                 
-                info = get_raster_info_cached(temp_path, uf.size)
+                info, error_msg = get_raster_info_cached(temp_path, uf.size)
                 if info:
                     raster_infos.append(info)
                 else:
-                    st.error(f"文件 {uf.name} 无法被读取为有效栅格，已跳过。")
+                    st.error(f"文件 {uf.name} 无法被读取为有效栅格: {error_msg}")
                     
         st.session_state.raster_infos = raster_infos
         st.session_state.processed_files_hash = current_hash
