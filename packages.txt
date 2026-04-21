@@ -1,18 +1,13 @@
 # ==========================================================
 # ⚠️ 非常重要：Streamlit Community Cloud 容器 (Debian Linux) 专有配置文件
-# 
-# 文件名必须叫 packages.txt 且必须放在仓库根目录。
-# 
-# 这里的依赖等同于在云主机的 root 环境中执行 `sudo apt-get update && sudo apt-get install -y <packages>`
-# 它发生在 pip install requirements.txt 之前。
-# 如果不安装这些，Python 里的 `pip install gdal` 将永远找不到底层的 C++ 头文件而失败。
 # ==========================================================
 
-# GDAL 核心二进制可执行文件 (如 gdalinfo, gdalwarp 等)
+# 确保在云端 Linux 安装核心 GDAL C++ 动态库
+# 对于 Streamlit Cloud 的 Debian 12，这会安装 3.6.2 或 3.6.4 版本的底层库。
+libgdal-dev
 gdal-bin
 
-# GDAL 的 C++ 头文件与动态链接库 (这是供 pip 编译 Python GDAL Wheel 的必须依赖，极其关键)
-libgdal-dev
-
-# 系统级 Python3 GDAL 绑定 (有时能作为保险手段直接暴露在 PYTHONPATH 中)
-python3-gdal
+# 安装编译所需的依赖（解决 numpy C header 等缺失问题）
+build-essential
+python3-dev
+python3-numpy
