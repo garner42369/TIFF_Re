@@ -2,13 +2,19 @@
 # Streamlit Community Cloud 容器 (Debian Linux) 专有配置文件
 # ==========================================================
 # 
-# ⚠️ 注意：由于在 app.py 与 requirements.txt 中我们已经弃用了 
-# 原生的 osgeo.gdal，转而使用了预编译自带底层库的 Rasterio。
+# ⚠️ 重要更新：虽然我们使用 Rasterio（自带预编译 GDAL），
+# 但在某些 Streamlit Cloud 容器环境中，Rasterio 的 wheel
+# 可能仍然需要系统级的 GDAL 头文件来完成安装或链接。
 #
-# 所以这里可以大幅精简。
-# 不再需要 libgdal-dev，也不再需要 build-essential 编译器。
-#
-# 但是，为了应用某些隐形的 C 语言依赖扩展能正常工作，
-# 建议保留以下基础开发包作为系统保底：
+# 因此，我们需要添加以下系统依赖作为保底：
+# ==========================================================
+
+# GDAL 系统库和头文件（Rasterio 可能需要）
+libgdal-dev
+gdal-bin
+
+# Python 开发头文件
 python3-dev
-python3-numpy
+
+# 基础编译工具（作为极端情况下的保底）
+build-essential
